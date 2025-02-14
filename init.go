@@ -8,11 +8,16 @@ import (
 	"log"
 	"net"
 	"reflect"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
 /*
+if a connection breaks, who should be the one initiating the reconnect ? because if both try to reconnect by sending the HANDSHAKE stuff, shit gets fucked
+
+
 TODO:
 
 when a connection does, we can save their writequeue and readqueue in case the connection is made again later
@@ -48,14 +53,35 @@ func getNewMessage(data string, header string) Message {
 }
 
 type Connection struct {
-	OurId        string // this is our id
-	PeerId       string // this is what we are connecting to, just an uuid like ClientId
-	IsInbound    bool   // who initiated this connection
-	WriteQueue   chan Message
-	ReadQueue    chan Message
-	Conn         net.Conn
-	sentACKs     sync.Map
-	receivedACKs sync.Map
+	OurId               string // this is our id
+	PeerId              string // this is what we are connecting to, just an uuid like ClientId
+	IsInbound           bool   // who initiated this connection
+	WriteQueue          chan Message
+	ReadQueue           chan Message
+	Conn                net.Conn
+	sentACKs            sync.Map
+	receivedACKs        sync.Map
+	handshakeInProgress sync.Mutex
+}
+
+func isConnectionReallyDead(conn net.Conn) bool {
+	tcpConn, ok := conn.(*net.TCPConn) // Type assertion
+	if !ok {
+		// Not a TCP connection, can't check properly
+		return true
+	}
+
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return true // Assume dead if we can't access low-level details
+	}
+
+	var socketError int
+	err = rawConn.Control(func(fd uintptr) {
+		socketError, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_ERROR)
+	})
+
+	return err != nil || socketError != 0
 }
 
 func serializeStruct(s interface{}) (string, error) {
@@ -70,6 +96,32 @@ func serializeStruct(s interface{}) (string, error) {
 	return string(data), nil
 }
 
+// even if we can reconnect somehow, we can't just switch c.Conn on the fly duh, multiple stuff is using it, read loop is using it, write loop is using it
+func tryToReconnect(c *Connection) {
+	if c.IsInbound {
+		// let the other guy try
+		return
+	}
+
+	conn := c.Conn
+	if isConnectionReallyDead(conn) {
+		remoteAddr := conn.RemoteAddr()
+		tcpAddr, ok := remoteAddr.(*net.TCPAddr)
+		if !ok {
+			log.Println("Not a TCP connection")
+			return
+		}
+
+		addr := tcpAddr.IP.String()
+		port := strconv.Itoa(tcpAddr.Port)
+		conn.Close()
+
+		// try to reestablish it
+		conn = InitConnection(addr, port, c.OurId).Conn
+		// WARN: changing conn on fly, might cause some race conds
+	}
+}
+
 func (c *Connection) writeToConnLoop() {
 	conn := c.Conn
 	for {
@@ -79,7 +131,8 @@ func (c *Connection) writeToConnLoop() {
 			encoder := json.NewEncoder(conn)
 			err := encoder.Encode(msg)
 			if err != nil {
-				log.Print("Error encoding message: %v\n", err)
+				log.Print("something wrong with the connection sire: ", conn)
+				// bhai aese to queue khaali ho jayegi :skull:
 				return
 			}
 
@@ -117,6 +170,7 @@ func (c *Connection) readFromConnLoop() {
 		if msg.header == "ACK_HANDSHAKE" {
 			// msg.data will be the peerId in this case
 			c.PeerId = msg.data
+			c.handshakeInProgress.Unlock()
 			continue
 		}
 
@@ -170,20 +224,26 @@ func InitConnection(addr string, port string, ourId string) Connection {
 
 	// Create new outbound connection
 	newConn := Connection{
-		OurId:        ourId,
-		IsInbound:    false,
-		WriteQueue:   make(chan Message, WRITE_QUEUE_BUFFER),
-		ReadQueue:    make(chan Message, READ_QUEUE_BUFFER),
-		Conn:         conn,
-		sentACKs:     sync.Map{},
-		receivedACKs: sync.Map{},
+		OurId:               ourId,
+		IsInbound:           false,
+		WriteQueue:          make(chan Message, WRITE_QUEUE_BUFFER),
+		ReadQueue:           make(chan Message, READ_QUEUE_BUFFER),
+		Conn:                conn,
+		sentACKs:            sync.Map{},
+		receivedACKs:        sync.Map{},
+		handshakeInProgress: sync.Mutex{},
 	}
 
 	go newConn.readFromConnLoop()
 	go newConn.writeToConnLoop()
 
+	newConn.handshakeInProgress.Lock()
 	newConn.doHandshake()
-	// TODO: wait here till the handshake is complete, we only return active connections, no async shit
+
+	// wtf man, are you a caveman ? use channels here
+	newConn.handshakeInProgress.Lock()
+	newConn.handshakeInProgress.Unlock()
+
 	return newConn
 }
 
