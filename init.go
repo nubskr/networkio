@@ -2,12 +2,9 @@ package main
 
 import (
 	"crypto/rand"
-	"encoding/json"
-	"errors"
-	"fmt"
+	"encoding/gob"
 	"log"
 	"net"
-	"reflect"
 	"strconv"
 	"sync"
 	"syscall"
@@ -41,10 +38,10 @@ const READ_QUEUE_BUFFER = 100
 type Message struct {
 	header string
 	uuid   string
-	data   string
+	data   any
 }
 
-func getNewMessage(data string, header string) Message {
+func getNewMessage(data any, header string) Message {
 	return Message{
 		header: header,
 		uuid:   getUUID(),
@@ -65,7 +62,7 @@ type Connection struct {
 }
 
 func isConnectionReallyDead(conn net.Conn) bool {
-	tcpConn, ok := conn.(*net.TCPConn) // Type assertion
+	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
 		// Not a TCP connection, can't check properly
 		return true
@@ -82,18 +79,6 @@ func isConnectionReallyDead(conn net.Conn) bool {
 	})
 
 	return err != nil || socketError != 0
-}
-
-func serializeStruct(s interface{}) (string, error) {
-	val := reflect.ValueOf(s)
-	if val.Kind() != reflect.Struct {
-		return "", errors.New("Not a struct!")
-	}
-	data, err := json.Marshal(s)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
 }
 
 // even if we can reconnect somehow, we can't just switch c.Conn on the fly duh, multiple stuff is using it, read loop is using it, write loop is using it
@@ -128,7 +113,7 @@ func (c *Connection) writeToConnLoop() {
 		msg := <-c.WriteQueue
 
 		for {
-			encoder := json.NewEncoder(conn)
+			encoder := gob.NewEncoder(conn)
 			err := encoder.Encode(msg)
 			if err != nil {
 				log.Print("something wrong with the connection sire: ", conn)
@@ -149,7 +134,7 @@ func (c *Connection) writeToConnLoop() {
 func (c *Connection) readFromConnLoop() {
 	conn := c.Conn
 	for {
-		decoder := json.NewDecoder(conn)
+		decoder := gob.NewDecoder(conn)
 		var msg Message
 		err := decoder.Decode(&msg)
 		if err != nil {
@@ -169,7 +154,7 @@ func (c *Connection) readFromConnLoop() {
 		}
 		if msg.header == "ACK_HANDSHAKE" {
 			// msg.data will be the peerId in this case
-			c.PeerId = msg.data
+			c.PeerId = msg.data.(string)
 			c.handshakeInProgress.Unlock()
 			continue
 		}
@@ -187,20 +172,16 @@ func (c *Connection) readFromConnLoop() {
 }
 
 func getUUID() string {
-	b := make([]byte, 16)
+	b := make([]byte, 5)
 	_, err := rand.Read(b)
 	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	return string(b)
 }
 
-func (c *Connection) WriteToConn(v interface{}) error {
-	data, err := serializeStruct(v)
-	if err != nil {
-		return err
-	}
-	c.WriteQueue <- getNewMessage(string(data), "PAYLOAD")
+func (c *Connection) WriteToConn(data any) error {
+	c.WriteQueue <- getNewMessage(data, "PAYLOAD")
 	return nil
 }
 
