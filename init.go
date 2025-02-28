@@ -1,8 +1,9 @@
-package main
+package networkio
 
 import (
 	"crypto/rand"
 	"encoding/gob"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -14,14 +15,11 @@ import (
 /*
 if a connection breaks, who should be the one initiating the reconnect ? because if both try to reconnect by sending the HANDSHAKE stuff, shit gets fucked
 
-
 TODO:
 
 when a connection does, we can save their writequeue and readqueue in case the connection is made again later
 
-use better serialization
-
-TODO handshake:
+handshake:
 
 send:
 - hi, I am `ClientId` and I wanna talk to you
@@ -35,23 +33,58 @@ handshake complete, maybe also exchange some encryption keys or smth
 const WRITE_QUEUE_BUFFER = 100
 const READ_QUEUE_BUFFER = 100
 
+type ConnectionManager struct {
+	mu          sync.Mutex
+	connections map[string]*Connection
+}
+
+var Manager = NewConnectionManager()
+
+func NewConnectionManager() *ConnectionManager {
+	return &ConnectionManager{connections: make(map[string]*Connection)}
+}
+
+func (cm *ConnectionManager) AddConnection(id string, c *Connection) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.connections[id] = c
+}
+
+func (cm *ConnectionManager) GetConnFromConnId(id string) (*Connection, bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	conn, exists := cm.connections[id]
+	return conn, exists
+}
+
+// RemoveConnection closes and unregisters a connection.
+func (cm *ConnectionManager) RemoveConnection(id string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if conn, exists := cm.connections[id]; exists {
+		conn.Conn.Close()
+		delete(cm.connections, id)
+	}
+}
+
 type Message struct {
-	header string
-	uuid   string
-	data   any
+	Header string
+	UUID   string
+	Data   any
 }
 
 func getNewMessage(data any, header string) Message {
 	return Message{
-		header: header,
-		uuid:   getUUID(),
-		data:   data,
+		Header: header,
+		UUID:   getUUID(),
+		Data:   data,
 	}
 }
 
 type Connection struct {
+	ConnId              string
 	OurId               string // this is our id
-	PeerId              string // this is what we are connecting to, just an uuid like ClientId
+	PeerId              string // this is who we're connecting to, just an uuid like ClientId
 	IsInbound           bool   // who initiated this connection
 	WriteQueue          chan Message
 	ReadQueue           chan Message
@@ -94,6 +127,7 @@ func tryToReconnect(c *Connection) {
 		tcpAddr, ok := remoteAddr.(*net.TCPAddr)
 		if !ok {
 			log.Println("Not a TCP connection")
+			Manager.RemoveConnection(c.ConnId)
 			return
 		}
 
@@ -102,7 +136,16 @@ func tryToReconnect(c *Connection) {
 		conn.Close()
 
 		// try to reestablish it
-		conn = InitConnection(addr, port, c.OurId).Conn
+		newConn, err := InitConnection(addr, port, c.OurId)
+		if err != nil {
+			log.Println("Error reconnecting:", err)
+			Manager.RemoveConnection(c.ConnId)
+			return
+		}
+
+		c.Conn = newConn.Conn
+		go c.readFromConnLoop()
+		go c.writeToConnLoop()
 		// WARN: changing conn on fly, might cause some race conds
 	}
 }
@@ -116,15 +159,16 @@ func (c *Connection) writeToConnLoop() {
 			encoder := gob.NewEncoder(conn)
 			err := encoder.Encode(msg)
 			if err != nil {
-				log.Print("something wrong with the connection sire: ", conn)
+				log.Print("something seems shady with the connection sire: ", conn)
 				// bhai aese to queue khaali ho jayegi :skull:
+				tryToReconnect(c)
 				return
 			}
 
 			// wait for ack, TODO: change this nasty shit later
 			time.Sleep(2 * time.Second)
 
-			if val, ok := c.receivedACKs.Load(msg.uuid); ok && val.(bool) {
+			if val, ok := c.receivedACKs.Load(msg.UUID); ok && val.(bool) {
 				break
 			}
 		}
@@ -142,31 +186,31 @@ func (c *Connection) readFromConnLoop() {
 			return
 		}
 
-		if msg.header == "HANDSHAKE" {
+		if msg.Header == "HANDSHAKE" {
 			ackMsg := getNewMessage(c.OurId, "ACK_HANDSHAKE")
 			c.WriteQueue <- ackMsg
 			return
 		}
 
-		if msg.header == "ACK" {
-			c.receivedACKs.Store(msg.data, true)
+		if msg.Header == "ACK" {
+			c.receivedACKs.Store(msg.Data, true)
 			continue
 		}
-		if msg.header == "ACK_HANDSHAKE" {
+		if msg.Header == "ACK_HANDSHAKE" {
 			// msg.data will be the peerId in this case
-			c.PeerId = msg.data.(string)
+			c.PeerId = msg.Data.(string)
 			c.handshakeInProgress.Unlock()
 			continue
 		}
 
-		ackMsg := getNewMessage(msg.uuid, "ACK")
+		ackMsg := getNewMessage(msg.UUID, "ACK")
 		c.WriteQueue <- ackMsg
 
-		if val, ok := c.sentACKs.Load(msg.uuid); ok && val.(bool) {
+		if val, ok := c.sentACKs.Load(msg.UUID); ok && val.(bool) {
 			continue
 		}
 
-		c.sentACKs.Store(msg.uuid, true)
+		c.sentACKs.Store(msg.UUID, true)
 		c.ReadQueue <- msg
 	}
 }
@@ -196,15 +240,14 @@ func (c *Connection) doHandshake() {
 
 // we go to someone, a -> b
 // note that it is the very starting, so no other communication is being done here
-func InitConnection(addr string, port string, ourId string) Connection {
+func InitConnection(addr string, port string, ourId string) (*Connection, error) {
 	conn, err := net.Dial("tcp", addr+":"+port)
 	if err != nil {
-		log.Printf("Error connecting to %s:%s: %v\n", addr, port, err)
-		return Connection{}
+		return nil, fmt.Errorf("error connecting to %s:%s: %v", addr, port, err)
 	}
 
-	// Create new outbound connection
-	newConn := Connection{
+	newConn := &Connection{
+		ConnId:              getUUID(),
 		OurId:               ourId,
 		IsInbound:           false,
 		WriteQueue:          make(chan Message, WRITE_QUEUE_BUFFER),
@@ -221,16 +264,19 @@ func InitConnection(addr string, port string, ourId string) Connection {
 	newConn.handshakeInProgress.Lock()
 	newConn.doHandshake()
 
-	// wtf man, are you a caveman ? use channels here
+	// Block until the handshake completes.
 	newConn.handshakeInProgress.Lock()
 	newConn.handshakeInProgress.Unlock()
 
-	return newConn
+	Manager.AddConnection(newConn.ConnId, newConn)
+
+	return newConn, nil
 }
 
-func AcceptConnRequestLoop(c *Connection) {
+func AcceptConnRequestLoop(OurId string) {
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
+		log.Println("Error listening on port 8080:", err)
 		return
 	}
 	defer listener.Close()
@@ -238,12 +284,13 @@ func AcceptConnRequestLoop(c *Connection) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			log.Println("Error accepting connection:", err)
 			continue
 		}
 
-		// someone comes to us, a <- b, they will init the handshake
 		newConn := &Connection{
-			OurId:        c.OurId,
+			ConnId:       getUUID(),
+			OurId:        OurId,
 			IsInbound:    true,
 			WriteQueue:   make(chan Message, WRITE_QUEUE_BUFFER),
 			ReadQueue:    make(chan Message, READ_QUEUE_BUFFER),
@@ -254,5 +301,7 @@ func AcceptConnRequestLoop(c *Connection) {
 
 		go newConn.readFromConnLoop()
 		go newConn.writeToConnLoop()
+
+		Manager.AddConnection(newConn.ConnId, newConn)
 	}
 }
