@@ -92,6 +92,7 @@ type Connection struct {
 	sentACKs            sync.Map
 	receivedACKs        sync.Map
 	handshakeInProgress sync.Mutex
+	handshakeDoneChan   chan struct{}
 }
 
 func isConnectionReallyDead(conn net.Conn) bool {
@@ -144,6 +145,8 @@ func tryToReconnect(c *Connection) {
 		}
 
 		c.Conn = newConn.Conn
+
+		// WARNNN: YAHA DO BAAR CHAL JAYEGA BRO writetoconnloop ka goroutine agar purana wala nahi break hua to to
 		go c.readFromConnLoop()
 		go c.writeToConnLoop()
 		// WARN: changing conn on fly, might cause some race conds
@@ -163,6 +166,13 @@ func (c *Connection) writeToConnLoop() {
 				// bhai aese to queue khaali ho jayegi :skull:
 				tryToReconnect(c)
 				return
+			} else {
+				log.Print("message sent nicely sire: ", msg)
+			}
+
+			if msg.Header == "HANDSHAKE" || msg.Header == "ACK" {
+				// don't wait for ack
+				break
 			}
 
 			// wait for ack, TODO: change this nasty shit later
@@ -183,35 +193,50 @@ func (c *Connection) readFromConnLoop() {
 		err := decoder.Decode(&msg)
 		if err != nil {
 			log.Printf("Error decoding message: %v\n", err)
-			return
+			// either something wrong with the conn or we just failed to debug the message
+
+			//
+
+			// panic("concurrency mix up hogya bruh kahi")
+		} else {
+			log.Print("we received something sire: ", msg)
 		}
 
 		if msg.Header == "HANDSHAKE" {
 			ackMsg := getNewMessage(c.OurId, "ACK_HANDSHAKE")
 			c.WriteQueue <- ackMsg
-			return
+			continue
 		}
 
 		if msg.Header == "ACK" {
-			c.receivedACKs.Store(msg.Data, true)
+			// log.Print("AN ACK RECEIVED, the data is: ", msg.Data.(string))
+			c.receivedACKs.Store(msg.Data.(string), true)
+			log.Print("just an ack, ignored!")
 			continue
 		}
 		if msg.Header == "ACK_HANDSHAKE" {
 			// msg.data will be the peerId in this case
 			c.PeerId = msg.Data.(string)
+			log.Print("handshake mutex unlocked!!!")
 			c.handshakeInProgress.Unlock()
-			continue
+			// ackMsg := getNewMessage(msg.UUID, "ACK")
+			// c.WriteQueue <- ackMsg
+			// continue
 		}
 
 		ackMsg := getNewMessage(msg.UUID, "ACK")
 		c.WriteQueue <- ackMsg
 
 		if val, ok := c.sentACKs.Load(msg.UUID); ok && val.(bool) {
+			// have we already processed this before ?
 			continue
 		}
 
 		c.sentACKs.Store(msg.UUID, true)
-		c.ReadQueue <- msg
+
+		if msg.Header == "PAYLOAD" {
+			c.ReadQueue <- msg
+		}
 	}
 }
 
@@ -225,11 +250,27 @@ func getUUID() string {
 }
 
 func (c *Connection) WriteToConn(data any) error {
+	select {
+	case <-c.handshakeDoneChan:
+		// safe to send now
+	case <-time.After(time.Second * 100):
+		// if you want a timeout, you can handle it here
+		return fmt.Errorf("timeout waiting for handshake completion")
+	}
+
 	c.WriteQueue <- getNewMessage(data, "PAYLOAD")
 	return nil
 }
 
 func (c *Connection) ReadFromConn() Message {
+	select {
+	case <-c.handshakeDoneChan:
+		// safe to send now
+	case <-time.After(time.Second * 100):
+		// if you want a timeout, you can handle it here
+		fmt.Errorf("timeout waiting for handshake completion")
+		return Message{}
+	}
 	return <-c.ReadQueue
 }
 
@@ -256,6 +297,7 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 		sentACKs:            sync.Map{},
 		receivedACKs:        sync.Map{},
 		handshakeInProgress: sync.Mutex{},
+		handshakeDoneChan:   make(chan struct{}),
 	}
 
 	go newConn.readFromConnLoop()
@@ -268,6 +310,8 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 	newConn.handshakeInProgress.Lock()
 	newConn.handshakeInProgress.Unlock()
 
+	close(newConn.handshakeDoneChan)
+
 	Manager.AddConnection(newConn.ConnId, newConn)
 
 	return newConn, nil
@@ -279,6 +323,7 @@ func AcceptConnRequestLoop(OurId string) {
 		log.Println("Error listening on port 8080:", err)
 		return
 	}
+	log.Print("server listening on 8080 sire")
 	defer listener.Close()
 
 	for {
