@@ -32,6 +32,9 @@ handshake complete, maybe also exchange some encryption keys or smth
 
 const WRITE_QUEUE_BUFFER = 100
 const READ_QUEUE_BUFFER = 100
+const MASTER_MESSAGE_QUEUE_BUFFER = 1000
+
+var MasterMessageQueue chan string = make(chan string, MASTER_MESSAGE_QUEUE_BUFFER)
 
 type ConnectionManager struct {
 	mu          sync.Mutex
@@ -88,11 +91,37 @@ type Connection struct {
 	IsInbound           bool   // who initiated this connection
 	WriteQueue          chan Message
 	ReadQueue           chan Message
+	ACKQueue            chan Message
 	Conn                net.Conn
 	sentACKs            sync.Map
 	receivedACKs        sync.Map
 	handshakeInProgress sync.Mutex
 	handshakeDoneChan   chan struct{}
+}
+
+func (c *Connection) doConnChores() {
+	go c.readFromConnLoop()
+	go c.writeToConnLoop()
+	go c.writeACKtoConnLoop()
+}
+
+func (c *Connection) writeACKtoConnLoop() {
+	conn := c.Conn
+	for {
+		msg := <-c.ACKQueue
+		// log.Print("trying to send: ", msg)
+
+		encoder := gob.NewEncoder(conn)
+		err := encoder.Encode(msg)
+		if err != nil {
+			log.Print("something seems shady with the connection sire: ", conn)
+			// bhai aese to queue khaali ho jayegi :skull:
+			tryToReconnect(c)
+			return
+		} else {
+			// log.Print("message sent nicely sire: ", msg)
+		}
+	}
 }
 
 func isConnectionReallyDead(conn net.Conn) bool {
@@ -147,8 +176,9 @@ func tryToReconnect(c *Connection) {
 		c.Conn = newConn.Conn
 
 		// WARNNN: YAHA DO BAAR CHAL JAYEGA BRO writetoconnloop ka goroutine agar purana wala nahi break hua to to
-		go c.readFromConnLoop()
-		go c.writeToConnLoop()
+		// go c.readFromConnLoop()
+		// go c.writeToConnLoop()
+		c.doConnChores()
 		// WARN: changing conn on fly, might cause some race conds
 	}
 }
@@ -157,6 +187,7 @@ func (c *Connection) writeToConnLoop() {
 	conn := c.Conn
 	for {
 		msg := <-c.WriteQueue
+		// log.Print("trying to send: ", msg)
 
 		for {
 			encoder := gob.NewEncoder(conn)
@@ -167,7 +198,7 @@ func (c *Connection) writeToConnLoop() {
 				tryToReconnect(c)
 				return
 			} else {
-				log.Print("message sent nicely sire: ", msg)
+				// log.Print("message sent nicely sire: ", msg)
 			}
 
 			if msg.Header == "HANDSHAKE" || msg.Header == "ACK" {
@@ -199,33 +230,39 @@ func (c *Connection) readFromConnLoop() {
 
 			// panic("concurrency mix up hogya bruh kahi")
 		} else {
-			log.Print("we received something sire: ", msg)
+			// log.Print("we received something sire: ", msg)
 		}
 
 		if msg.Header == "HANDSHAKE" {
 			ackMsg := getNewMessage(c.OurId, "ACK_HANDSHAKE")
 			c.WriteQueue <- ackMsg
+			close(c.handshakeDoneChan)
 			continue
 		}
 
 		if msg.Header == "ACK" {
 			// log.Print("AN ACK RECEIVED, the data is: ", msg.Data.(string))
 			c.receivedACKs.Store(msg.Data.(string), true)
-			log.Print("just an ack, ignored!")
+			// log.Print("just an ack, ignored!")
 			continue
 		}
 		if msg.Header == "ACK_HANDSHAKE" {
 			// msg.data will be the peerId in this case
 			c.PeerId = msg.Data.(string)
-			log.Print("handshake mutex unlocked!!!")
+			// log.Print("handshake mutex unlocked!!!")
+
+			// TODO: check if already unlocked you monkey !!
+
 			c.handshakeInProgress.Unlock()
 			// ackMsg := getNewMessage(msg.UUID, "ACK")
 			// c.WriteQueue <- ackMsg
 			// continue
 		}
 
+		// log.Print("trying to send ack for: ", msg)
 		ackMsg := getNewMessage(msg.UUID, "ACK")
-		c.WriteQueue <- ackMsg
+		c.ACKQueue <- ackMsg
+		// log.Print("ack put in write queue")
 
 		if val, ok := c.sentACKs.Load(msg.UUID); ok && val.(bool) {
 			// have we already processed this before ?
@@ -236,6 +273,7 @@ func (c *Connection) readFromConnLoop() {
 
 		if msg.Header == "PAYLOAD" {
 			c.ReadQueue <- msg
+			MasterMessageQueue <- c.ConnId // just so that the application knows where to look at
 		}
 	}
 }
@@ -253,7 +291,7 @@ func (c *Connection) WriteToConn(data any) error {
 	select {
 	case <-c.handshakeDoneChan:
 		// safe to send now
-	case <-time.After(time.Second * 100):
+	case <-time.After(time.Second * 2):
 		// if you want a timeout, you can handle it here
 		return fmt.Errorf("timeout waiting for handshake completion")
 	}
@@ -266,9 +304,10 @@ func (c *Connection) ReadFromConn() Message {
 	select {
 	case <-c.handshakeDoneChan:
 		// safe to send now
-	case <-time.After(time.Second * 100):
+	case <-time.After(time.Second * 2):
 		// if you want a timeout, you can handle it here
-		fmt.Errorf("timeout waiting for handshake completion")
+		// fmt.Errorf("timeout waiting for handshake completion")
+		panic("yeah, we f'ed up")
 		return Message{}
 	}
 	return <-c.ReadQueue
@@ -276,7 +315,7 @@ func (c *Connection) ReadFromConn() Message {
 
 func (c *Connection) doHandshake() {
 	c.WriteQueue <- getNewMessage(c.OurId, "HANDSHAKE")
-	log.Print("handshake initiated")
+	// log.Print("handshake initiated")
 }
 
 // we go to someone, a -> b
@@ -293,6 +332,7 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 		IsInbound:           false,
 		WriteQueue:          make(chan Message, WRITE_QUEUE_BUFFER),
 		ReadQueue:           make(chan Message, READ_QUEUE_BUFFER),
+		ACKQueue:            make(chan Message, 1),
 		Conn:                conn,
 		sentACKs:            sync.Map{},
 		receivedACKs:        sync.Map{},
@@ -300,8 +340,9 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 		handshakeDoneChan:   make(chan struct{}),
 	}
 
-	go newConn.readFromConnLoop()
-	go newConn.writeToConnLoop()
+	newConn.doConnChores()
+	// go newConn.readFromConnLoop()
+	// go newConn.writeToConnLoop()
 
 	newConn.handshakeInProgress.Lock()
 	newConn.doHandshake()
@@ -334,19 +375,21 @@ func AcceptConnRequestLoop(OurId string) {
 		}
 
 		newConn := &Connection{
-			ConnId:       getUUID(),
-			OurId:        OurId,
-			IsInbound:    true,
-			WriteQueue:   make(chan Message, WRITE_QUEUE_BUFFER),
-			ReadQueue:    make(chan Message, READ_QUEUE_BUFFER),
-			Conn:         conn,
-			sentACKs:     sync.Map{},
-			receivedACKs: sync.Map{},
+			ConnId:            getUUID(),
+			OurId:             OurId,
+			IsInbound:         true,
+			WriteQueue:        make(chan Message, WRITE_QUEUE_BUFFER),
+			ReadQueue:         make(chan Message, READ_QUEUE_BUFFER),
+			ACKQueue:          make(chan Message, 1),
+			Conn:              conn,
+			sentACKs:          sync.Map{},
+			receivedACKs:      sync.Map{},
+			handshakeDoneChan: make(chan struct{}),
 		}
 
-		go newConn.readFromConnLoop()
-		go newConn.writeToConnLoop()
-
+		// go newConn.readFromConnLoop()
+		// go newConn.writeToConnLoop()
+		newConn.doConnChores()
 		Manager.AddConnection(newConn.ConnId, newConn)
 	}
 }
