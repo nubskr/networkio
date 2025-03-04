@@ -30,6 +30,8 @@ receive:
 handshake complete, maybe also exchange some encryption keys or smth
 */
 
+// if connection breaks, all goroutines associated with it must exit!
+
 const WRITE_QUEUE_BUFFER = 100
 const READ_QUEUE_BUFFER = 100
 const MASTER_MESSAGE_QUEUE_BUFFER = 1000
@@ -97,31 +99,13 @@ type Connection struct {
 	receivedACKs        sync.Map
 	handshakeInProgress sync.Mutex
 	handshakeDoneChan   chan struct{}
+	ConnectionDead      chan struct{}
 }
 
 func (c *Connection) doConnChores() {
 	go c.readFromConnLoop()
 	go c.writeToConnLoop()
 	go c.writeACKtoConnLoop()
-}
-
-func (c *Connection) writeACKtoConnLoop() {
-	conn := c.Conn
-	for {
-		msg := <-c.ACKQueue
-		// log.Print("trying to send: ", msg)
-
-		encoder := gob.NewEncoder(conn)
-		err := encoder.Encode(msg)
-		if err != nil {
-			log.Print("something seems shady with the connection sire: ", conn)
-			// bhai aese to queue khaali ho jayegi :skull:
-			tryToReconnect(c)
-			return
-		} else {
-			// log.Print("message sent nicely sire: ", msg)
-		}
-	}
 }
 
 func isConnectionReallyDead(conn net.Conn) bool {
@@ -175,21 +159,17 @@ func tryToReconnect(c *Connection) {
 
 		c.Conn = newConn.Conn
 
-		// WARNNN: YAHA DO BAAR CHAL JAYEGA BRO writetoconnloop ka goroutine agar purana wala nahi break hua to to
-		// go c.readFromConnLoop()
-		// go c.writeToConnLoop()
+		close(c.ConnectionDead)
 		c.doConnChores()
 		// WARN: changing conn on fly, might cause some race conds
 	}
 }
 
-func (c *Connection) writeToConnLoop() {
+func (c *Connection) writeACKtoConnLoop() {
 	conn := c.Conn
 	for {
-		msg := <-c.WriteQueue
-		// log.Print("trying to send: ", msg)
-
-		for {
+		select {
+		case msg := <-c.ACKQueue:
 			encoder := gob.NewEncoder(conn)
 			err := encoder.Encode(msg)
 			if err != nil {
@@ -197,21 +177,44 @@ func (c *Connection) writeToConnLoop() {
 				// bhai aese to queue khaali ho jayegi :skull:
 				tryToReconnect(c)
 				return
-			} else {
-				// log.Print("message sent nicely sire: ", msg)
 			}
 
-			if msg.Header == "HANDSHAKE" || msg.Header == "ACK" {
-				// don't wait for ack
-				break
+		case <-c.ConnectionDead:
+			// conn ded
+			return
+		}
+	}
+}
+
+func (c *Connection) writeToConnLoop() {
+	conn := c.Conn
+	for {
+		select {
+		case msg := <-c.WriteQueue:
+			for {
+				encoder := gob.NewEncoder(conn)
+				err := encoder.Encode(msg)
+				if err != nil {
+					log.Print("something seems shady with the connection sire: ", conn)
+					tryToReconnect(c)
+					return
+				}
+
+				if msg.Header == "HANDSHAKE" || msg.Header == "ACK" {
+					break
+				}
+
+				// waiting for ack, TODO: change this nasty shit later
+				time.Sleep(2 * time.Second)
+
+				if val, ok := c.receivedACKs.Load(msg.UUID); ok && val.(bool) {
+					break
+				}
 			}
 
-			// wait for ack, TODO: change this nasty shit later
-			time.Sleep(2 * time.Second)
-
-			if val, ok := c.receivedACKs.Load(msg.UUID); ok && val.(bool) {
-				break
-			}
+		case <-c.ConnectionDead:
+			// conn ded
+			return
 		}
 	}
 }
@@ -223,27 +226,27 @@ func (c *Connection) readFromConnLoop() {
 		var msg Message
 		err := decoder.Decode(&msg)
 		if err != nil {
-			log.Printf("Error decoding message: %v\n", err)
-			// either something wrong with the conn or we just failed to debug the message
-
-			//
-
+			log.Printf("Error decoding message or something wrong with the connetion: %v\n", err)
 			// panic("concurrency mix up hogya bruh kahi")
 		} else {
 			// log.Print("we received something sire: ", msg)
 		}
 
 		if msg.Header == "HANDSHAKE" {
-			ackMsg := getNewMessage(c.OurId, "ACK_HANDSHAKE")
-			c.WriteQueue <- ackMsg
-			close(c.handshakeDoneChan)
+			// check if the handshakeDoneChan is open, only send the ACK_HANDSHAKE if not already done
+			select {
+			case <-c.handshakeDoneChan:
+				// Channel is already closed, do nothing
+			default:
+				ackMsg := getNewMessage(c.OurId, "ACK_HANDSHAKE")
+				c.WriteQueue <- ackMsg
+				close(c.handshakeDoneChan)
+			}
 			continue
 		}
 
 		if msg.Header == "ACK" {
-			// log.Print("AN ACK RECEIVED, the data is: ", msg.Data.(string))
 			c.receivedACKs.Store(msg.Data.(string), true)
-			// log.Print("just an ack, ignored!")
 			continue
 		}
 		if msg.Header == "ACK_HANDSHAKE" {
@@ -251,18 +254,11 @@ func (c *Connection) readFromConnLoop() {
 			c.PeerId = msg.Data.(string)
 			// log.Print("handshake mutex unlocked!!!")
 
-			// TODO: check if already unlocked you monkey !!
-
 			c.handshakeInProgress.Unlock()
-			// ackMsg := getNewMessage(msg.UUID, "ACK")
-			// c.WriteQueue <- ackMsg
-			// continue
 		}
 
-		// log.Print("trying to send ack for: ", msg)
 		ackMsg := getNewMessage(msg.UUID, "ACK")
 		c.ACKQueue <- ackMsg
-		// log.Print("ack put in write queue")
 
 		if val, ok := c.sentACKs.Load(msg.UUID); ok && val.(bool) {
 			// have we already processed this before ?
@@ -279,7 +275,7 @@ func (c *Connection) readFromConnLoop() {
 }
 
 func getUUID() string {
-	b := make([]byte, 5)
+	b := make([]byte, 4)
 	_, err := rand.Read(b)
 	if err != nil {
 		return ""
@@ -305,7 +301,6 @@ func (c *Connection) ReadFromConn() Message {
 	case <-c.handshakeDoneChan:
 		// safe to send now
 	case <-time.After(time.Second * 2):
-		// if you want a timeout, you can handle it here
 		// fmt.Errorf("timeout waiting for handshake completion")
 		panic("yeah, we f'ed up")
 		return Message{}
@@ -338,11 +333,10 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 		receivedACKs:        sync.Map{},
 		handshakeInProgress: sync.Mutex{},
 		handshakeDoneChan:   make(chan struct{}),
+		ConnectionDead:      make(chan struct{}),
 	}
 
 	newConn.doConnChores()
-	// go newConn.readFromConnLoop()
-	// go newConn.writeToConnLoop()
 
 	newConn.handshakeInProgress.Lock()
 	newConn.doHandshake()
@@ -385,10 +379,9 @@ func AcceptConnRequestLoop(OurId string) {
 			sentACKs:          sync.Map{},
 			receivedACKs:      sync.Map{},
 			handshakeDoneChan: make(chan struct{}),
+			ConnectionDead:    make(chan struct{}),
 		}
 
-		// go newConn.readFromConnLoop()
-		// go newConn.writeToConnLoop()
 		newConn.doConnChores()
 		Manager.AddConnection(newConn.ConnId, newConn)
 	}
