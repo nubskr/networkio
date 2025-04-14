@@ -47,11 +47,11 @@ func TestMessageTransmission(t *testing.T) {
 	require.NotNil(t, clientConn)
 
 	msg := "Hello ser!"
-	err = clientConn.WriteToConn(msg)
+	err = clientConn.WriteToConn(*getNewMessage(msg, "PAYLOAD"))
 	require.NoError(t, err)
 
 	// check from server if the message actually arrives or not
-	connId := <-MasterMessageQueue
+	connId := <-masterNotificationPullQueueChan
 	conn, exists := Manager.GetConnFromConnId(connId)
 	if exists {
 		recMsg := conn.ReadFromConn().Data.(string)
@@ -112,12 +112,12 @@ func TestMessageQueueing(t *testing.T) {
 
 	msg1 := "Message 1"
 
-	err = clientConn.WriteToConn(msg1)
+	err = clientConn.WriteToConn(*getNewMessage(msg1, "PAYLOAD"))
 	require.NoError(t, err)
-	err = clientConn.WriteToConn(msg1)
+	err = clientConn.WriteToConn(*getNewMessage(msg1, "PAYLOAD"))
 	require.NoError(t, err)
 
 	time.Sleep(time.Second * 5)
 
-	assert.Equal(t, 2, len(MasterMessageQueue))
+	assert.Equal(t, 2, len(masterNotificationPullQueueChan))
 }

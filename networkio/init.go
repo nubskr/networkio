@@ -36,8 +36,7 @@ const WRITE_QUEUE_BUFFER = 100
 const READ_QUEUE_BUFFER = 100
 const MASTER_MESSAGE_QUEUE_BUFFER = 1000
 
-var MasterMessageQueue chan string = make(chan string, MASTER_MESSAGE_QUEUE_BUFFER)
-
+// id -> Connection obj
 type ConnectionManager struct {
 	mu          sync.Mutex
 	connections map[string]*Connection
@@ -78,8 +77,8 @@ type Message struct {
 	Data   any
 }
 
-func getNewMessage(data any, header string) Message {
-	return Message{
+func getNewMessage(data any, header string) *Message {
+	return &Message{
 		Header: header,
 		UUID:   getUUID(),
 		Data:   data,
@@ -239,7 +238,7 @@ func (c *Connection) readFromConnLoop() {
 				// Channel is already closed, do nothing
 			default:
 				ackMsg := getNewMessage(c.OurId, "ACK_HANDSHAKE")
-				c.WriteQueue <- ackMsg
+				c.WriteQueue <- *ackMsg
 				close(c.handshakeDoneChan)
 			}
 			continue
@@ -258,7 +257,7 @@ func (c *Connection) readFromConnLoop() {
 		}
 
 		ackMsg := getNewMessage(msg.UUID, "ACK")
-		c.ACKQueue <- ackMsg
+		c.ACKQueue <- *ackMsg
 
 		if val, ok := c.sentACKs.Load(msg.UUID); ok && val.(bool) {
 			// have we already processed this before ?
@@ -269,7 +268,7 @@ func (c *Connection) readFromConnLoop() {
 
 		if msg.Header == "PAYLOAD" {
 			c.ReadQueue <- msg
-			MasterMessageQueue <- c.ConnId // just so that the application knows where to look at
+			masterNotificationPullQueueChan <- c.ConnId // just so that the application knows where to look at
 		}
 	}
 }
@@ -283,7 +282,7 @@ func getUUID() string {
 	return string(b)
 }
 
-func (c *Connection) WriteToConn(data any) error {
+func (c *Connection) WriteToConn(data Message) error {
 	select {
 	case <-c.handshakeDoneChan:
 		// safe to send now
@@ -292,7 +291,7 @@ func (c *Connection) WriteToConn(data any) error {
 		return fmt.Errorf("timeout waiting for handshake completion")
 	}
 
-	c.WriteQueue <- getNewMessage(data, "PAYLOAD")
+	c.WriteQueue <- data
 	return nil
 }
 
@@ -309,7 +308,7 @@ func (c *Connection) ReadFromConn() Message {
 }
 
 func (c *Connection) doHandshake() {
-	c.WriteQueue <- getNewMessage(c.OurId, "HANDSHAKE")
+	c.WriteQueue <- *getNewMessage(c.OurId, "HANDSHAKE")
 	// log.Print("handshake initiated")
 }
 
@@ -341,7 +340,7 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 	newConn.handshakeInProgress.Lock()
 	newConn.doHandshake()
 
-	// Block until the handshake completes.
+	// Block until the handshake completes, please remove the below shit btw
 	newConn.handshakeInProgress.Lock()
 	newConn.handshakeInProgress.Unlock()
 

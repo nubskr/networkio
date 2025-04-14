@@ -34,3 +34,27 @@ then we call the retry from there, if we detect the connection actually broken,
 be stop the writing routines whether they are blocked on some IO or not, and if they are inside the inner loop, they'll fail with an error by themselves, because the connection itself is broken
 
 and the ones waiting on IO will be exited with the connectionDead channel closing
+
+---
+
+
+dispacher will get:
+
+Event
+{
+    conn_id: string
+    msg: Message object
+}
+
+then it will queue this shit and then to consume it: get the connection object from conn id and just call connection.writeToConn from there and that's it
+
+if the application wants to track delivery, they can poll over ReceivedACKs map or whatever
+
+this is for sending messages and tracking their deliveries part
+
+
+
+
+what about receiving message events, can we use the same Event object for this ? 
+
+yes, but we won't need to worry about msg at all, we can just... nudge the application like "hey, there is some data in this connection channel, you should check it" or smth and that would be it
