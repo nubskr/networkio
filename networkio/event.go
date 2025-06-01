@@ -5,7 +5,7 @@ type Event struct {
 	msg    Message
 }
 
-func getNewEvent(connId string, msg string) *Event {
+func GetNewEvent(connId string, msg string) *Event {
 	return &Event{
 		connId: connId,
 		msg:    *getNewMessage(msg, "PAYLOAD"),

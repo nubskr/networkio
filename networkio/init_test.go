@@ -10,7 +10,7 @@ import (
 )
 
 func TestInitConnection(t *testing.T) {
-	go AcceptConnRequestLoop("server")
+	go AcceptConnRequestLoop("server", 8080)
 	time.Sleep(time.Second)
 
 	conn, err := InitConnection("127.0.0.1", "8080", "client")
@@ -22,7 +22,7 @@ func TestInitConnection(t *testing.T) {
 
 // TODO: make it more rigorous
 func TestHandshake(t *testing.T) {
-	go AcceptConnRequestLoop("server")
+	go AcceptConnRequestLoop("server", 8080)
 	time.Sleep(time.Second)
 
 	conn, err := InitConnection("127.0.0.1", "8080", "client")
@@ -39,7 +39,7 @@ func TestHandshake(t *testing.T) {
 
 // TODO: this can be made more rigorous!
 func TestMessageTransmission(t *testing.T) {
-	go AcceptConnRequestLoop("server")
+	go AcceptConnRequestLoop("server", 8080)
 	time.Sleep(time.Second * 2)
 
 	clientConn, err := InitConnection("127.0.0.1", "8080", "client")
@@ -64,7 +64,7 @@ func TestMessageTransmission(t *testing.T) {
 
 // TODO: this is totally bullshit, fix it
 func TestReconnect(t *testing.T) {
-	go AcceptConnRequestLoop("server")
+	go AcceptConnRequestLoop("server", 8080)
 	time.Sleep(time.Second)
 
 	clientConn, err := InitConnection("127.0.0.1", "8080", "client")
@@ -81,7 +81,7 @@ func TestReconnect(t *testing.T) {
 
 // TODO: can be made better
 func TestMultipleClients(t *testing.T) {
-	go AcceptConnRequestLoop("server")
+	go AcceptConnRequestLoop("server", 8080)
 	time.Sleep(time.Second)
 
 	var clients []*Connection
@@ -103,7 +103,7 @@ func TestMultipleClients(t *testing.T) {
 
 // TODO: this doesnt tests for shit, make it better
 func TestMessageQueueing(t *testing.T) {
-	go AcceptConnRequestLoop("server")
+	go AcceptConnRequestLoop("server", 8080)
 	time.Sleep(time.Second * 2)
 
 	clientConn, err := InitConnection("127.0.0.1", "8080", "client")

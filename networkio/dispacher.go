@@ -3,7 +3,7 @@ package networkio
 import "log"
 
 // func: a consumer which consumes events and pushes to connections
-func eventDispacherWorker() {
+func EventDispacherWorker() {
 	for {
 		event := <-masterNotificationPushQueueChan
 

@@ -1,0 +1,29 @@
+// package main
+
+// import (
+// 	"log"
+// 	"time"
+
+// 	"github.com/nubskr/networkio/networkio"
+// )
+
+// func main() {
+// 	go networkio.AcceptConnRequestLoop("server-001", 8081)
+// 	go networkio.EventDispacherWorker()
+
+// 	time.Sleep(1 * time.Second)
+// 	log.Print("hi")
+
+// 	conn, err := networkio.InitConnection("127.0.0.1", "8080", "client")
+
+// 	if err == nil {
+// 		log.Print("conn success")
+// 		log.Print(conn.ConnId)
+
+// 		networkio.PushNotification(networkio.GetNewEvent(conn.ConnId, "hieeeee"))
+// 	} else {
+// 		panic(err)
+// 	}
+
+// 	select {}
+// }

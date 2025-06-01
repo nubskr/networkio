@@ -228,7 +228,7 @@ func (c *Connection) readFromConnLoop() {
 			log.Printf("Error decoding message or something wrong with the connetion: %v\n", err)
 			// panic("concurrency mix up hogya bruh kahi")
 		} else {
-			// log.Print("we received something sire: ", msg)
+			log.Print("we received something sire: ", msg)
 		}
 
 		if msg.Header == "HANDSHAKE" {
@@ -315,7 +315,7 @@ func (c *Connection) doHandshake() {
 // we go to someone, a -> b
 // note that it is the very starting, so no other communication is being done here
 func InitConnection(addr string, port string, ourId string) (*Connection, error) {
-	conn, err := net.Dial("tcp", addr+":"+port)
+	conn, err := net.DialTimeout("tcp", addr+":"+port, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("error connecting to %s:%s: %v", addr, port, err)
 	}
@@ -351,13 +351,13 @@ func InitConnection(addr string, port string, ourId string) (*Connection, error)
 	return newConn, nil
 }
 
-func AcceptConnRequestLoop(OurId string) {
-	listener, err := net.Listen("tcp", ":8080")
+func AcceptConnRequestLoop(OurId string, port int) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Println("Error listening on port 8080:", err)
 		return
 	}
-	log.Print("server listening on 8080 sire")
+	log.Printf("server listening on %d sire", port)
 	defer listener.Close()
 
 	for {
@@ -384,4 +384,9 @@ func AcceptConnRequestLoop(OurId string) {
 		newConn.doConnChores()
 		Manager.AddConnection(newConn.ConnId, newConn)
 	}
+}
+
+func IsActivePeer(addr string) bool {
+	// TODO
+	return true
 }
